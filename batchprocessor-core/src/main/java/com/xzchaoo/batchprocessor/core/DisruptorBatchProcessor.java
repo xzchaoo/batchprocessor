@@ -217,4 +217,8 @@ public class DisruptorBatchProcessor<T> implements BatchProcessor<T> {
             }
         }
     }
+
+    public Disruptor<?> getDisruptor() {
+        return disruptor;
+    }
 }
