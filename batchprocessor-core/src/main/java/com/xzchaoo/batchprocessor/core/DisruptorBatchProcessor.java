@@ -161,7 +161,7 @@ public class DisruptorBatchProcessor<T> implements BatchProcessor<T> {
         int batchSize = properties.getBatchSize();
         int minBatchSize = properties.getMinBatchSize();
         for (int i = 0; i < workerCount; i++) {
-            FooEventHandler<T> handler = new FooEventHandler<>(i, batchSize, minBatchSize, batchTime, limiter,
+            InnerEventHandler<T> handler = new InnerEventHandler<>(i, batchSize, minBatchSize, batchTime, limiter,
                 reporter);
             this.disruptor.handleEventsWith(handler);
         }

@@ -11,9 +11,8 @@ import java.util.Objects;
 
 /**
  * @author xzchaoo
- * @date 2019/9/6
  */
-class FooEventHandler<T> implements EventHandler<Event<T>>, TimeoutHandler {
+class InnerEventHandler<T> implements EventHandler<Event<T>>, TimeoutHandler {
     private final int workerIndex;
     private final List<T> buffer;
     private final int bufferSize;
@@ -23,12 +22,12 @@ class FooEventHandler<T> implements EventHandler<Event<T>>, TimeoutHandler {
     private final long forceFlushInterval;
     private long lastUpdateTime;
 
-    FooEventHandler(int workerIndex,
-                    int batchSize,
-                    int minBatchSize,
-                    long forceFlushInterval,
-                    Limiter limiter,
-                    AsyncProcessor<T> reporter) {
+    InnerEventHandler(int workerIndex,
+                      int batchSize,
+                      int minBatchSize,
+                      long forceFlushInterval,
+                      Limiter limiter,
+                      AsyncProcessor<T> reporter) {
         this.workerIndex = workerIndex;
         this.bufferSize = batchSize;
         this.buffer = new ArrayList<>(batchSize);

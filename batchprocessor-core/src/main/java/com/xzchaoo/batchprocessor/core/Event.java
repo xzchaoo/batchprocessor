@@ -3,7 +3,6 @@ package com.xzchaoo.batchprocessor.core;
 
 /**
  * @author xzchaoo
- * @date 2019/9/6
  */
 class Event<T> {
     T t;
