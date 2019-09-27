@@ -5,6 +5,7 @@ import com.lmax.disruptor.ExceptionHandler;
 import com.lmax.disruptor.InsufficientCapacityException;
 import com.lmax.disruptor.LiteTimeoutBlockingWaitStrategy;
 import com.lmax.disruptor.RingBuffer;
+import com.lmax.disruptor.SequenceBarrier;
 import com.lmax.disruptor.TimeoutException;
 import com.lmax.disruptor.dsl.Disruptor;
 import com.lmax.disruptor.dsl.ProducerType;
@@ -23,6 +24,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 /**
  * @author xzchaoo
  */
+@SuppressWarnings("WeakerAccess")
 public class DisruptorBatchProcessor<T> implements BatchProcessor<T> {
     private static final Logger LOGGER = LoggerFactory.getLogger(DisruptorBatchProcessor.class);
     private static final AtomicInteger ID = new AtomicInteger();
@@ -33,15 +35,18 @@ public class DisruptorBatchProcessor<T> implements BatchProcessor<T> {
     private final int workerCount;
     private final Limiter limiter;
     private final int maxBatchSize;
-    private final int splitBatchSize;
     private final AsyncProcessor<T> reporter;
 
     public DisruptorBatchProcessor(DisruptorBufferWriterProperties properties, AsyncProcessor<T> reporter) {
         this.properties = Objects.requireNonNull(properties);
         this.reporter = Objects.requireNonNull(reporter);
+        this.workerCount = properties.getWorkerCount();
+        if (workerCount <= 0) {
+            throw new IllegalArgumentException("workerCount must greater than 0");
+        }
+
         int bufferSize = properties.getQueueSize();
         this.maxBatchSize = Math.min(bufferSize, Math.max(bufferSize / 4, 512));
-        this.splitBatchSize = Math.min(maxBatchSize, Math.max(bufferSize / 16, 128));
         ThreadFactory threadFactory = properties.getThreadFactory() != null ? properties.getThreadFactory() :
             new ThreadFactoryBuilder()
                 .setNameFormat("DisruptorBatchProcessor-" + ID.getAndIncrement() + "-%d")
@@ -55,14 +60,11 @@ public class DisruptorBatchProcessor<T> implements BatchProcessor<T> {
             new LiteTimeoutBlockingWaitStrategy(properties.getBatchTime(), TimeUnit.MILLISECONDS));
 
         this.ringBuffer = this.disruptor.getRingBuffer();
-
         this.limiter = new MixedLimiter(properties.getConcurrency(), properties.getTps(), properties.getIps());
-        this.workerCount = properties.getWorkerCount();
 
         ExceptionHandler<Event<T>> exceptionHandler = new ExceptionHandler<Event<T>>() {
             @Override
             public void handleEventException(Throwable ex, long sequence, Event<T> event) {
-                // 几乎不太可能
                 LOGGER.error("handleEventException {}", event, ex);
             }
 
@@ -85,6 +87,7 @@ public class DisruptorBatchProcessor<T> implements BatchProcessor<T> {
 
     @Override
     public void put(T t) {
+        ensureStarted();
         if (t == null) {
             return;
         }
@@ -107,6 +110,7 @@ public class DisruptorBatchProcessor<T> implements BatchProcessor<T> {
 
     @Override
     public void put(Collection<T> c) {
+        ensureStarted();
         if (c == null || c.isEmpty()) {
             return;
         }
@@ -114,10 +118,10 @@ public class DisruptorBatchProcessor<T> implements BatchProcessor<T> {
 
         // 太大不可能一口气放进去 只能单个放 或 分小批
         if (size > maxBatchSize) {
-            List<T> buffer = new ArrayList<>(splitBatchSize);
+            List<T> buffer = new ArrayList<>(maxBatchSize);
             for (T t : c) {
                 buffer.add(t);
-                if (buffer.size() == splitBatchSize) {
+                if (buffer.size() == maxBatchSize) {
                     put(buffer);
                     buffer.clear();
                 }
@@ -160,16 +164,29 @@ public class DisruptorBatchProcessor<T> implements BatchProcessor<T> {
         long batchTime = properties.getBatchTime();
         int batchSize = properties.getBatchSize();
         int minBatchSize = properties.getMinBatchSize();
+
+        // 这里我们保留最后一个worker的barrier
+        SequenceBarrier anyBarrier = null;
         for (int i = 0; i < workerCount; i++) {
             InnerEventHandler<T> handler = new InnerEventHandler<>(i, batchSize, minBatchSize, batchTime, limiter,
                 reporter);
-            this.disruptor.handleEventsWith(handler);
+            anyBarrier = this.disruptor.handleEventsWith(handler).asSequenceBarrier();
         }
+        // disruptor的start方法内部会去启动线程, 而启动线程理论上需要一定的时间
+        // 如果在线程启动之前, 就往buffer里put数据, 然后shutdown, 那么这部分数据不会被执行
+        // 因此这里的一个策略是进行一次flush(肯定不会flush任何数据), 并且等到sequence 0可用! 这就确保此时最后一个worker已经启动!
         this.disruptor.start();
+        this.flush();
+        try {
+            anyBarrier.waitFor(0);
+        } catch (Exception e) {
+            throw new IllegalStateException("fail to wait for disruptor to start", e);
+        }
     }
 
     @Override
     public void flush() {
+        ensureStarted();
         for (int i = 0; i < workerCount; i++) {
             this.ringBuffer.publishEvent((event, sequence, workerIndex) -> {
                 event.clear();
@@ -181,10 +198,12 @@ public class DisruptorBatchProcessor<T> implements BatchProcessor<T> {
 
     @Override
     public void stop() {
+        // 先标记为stop, 此后进来的数据会被拒绝
         int oldState = state.getAndSet(2);
         if (oldState != 1) {
             return;
         }
+        // 关闭disruptor, 内部实现会等到最新的cursor被消费完
         try {
             disruptor.shutdown(properties.getCloseWaitTime(), TimeUnit.SECONDS);
         } catch (TimeoutException e) {
@@ -200,7 +219,7 @@ public class DisruptorBatchProcessor<T> implements BatchProcessor<T> {
                 // 依旧有正在执行的请求 此时只能异常了
                 throw new IllegalStateException("依旧有正在执行的请求");
             }
-            limiter.releaseConcurrency();
+            limiter.releaseConcurrency(properties.getConcurrency());
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new IllegalStateException(e);
@@ -218,6 +237,11 @@ public class DisruptorBatchProcessor<T> implements BatchProcessor<T> {
         }
     }
 
+    /**
+     * 获得底层的disruptor, 但不暴露泛型
+     *
+     * @return disruptor
+     */
     public Disruptor<?> getDisruptor() {
         return disruptor;
     }
