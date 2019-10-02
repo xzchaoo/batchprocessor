@@ -1,5 +1,8 @@
 # release notes #
 
+## 1.1.0 ##
+- 将配置类更名为 BatchProcessorProperties
+
 ## 1.0.3 ##
 - 修复disruptor的worker线程在实际启动之前disruptor就被shutdown, 从而导致数据丢失的问题
 

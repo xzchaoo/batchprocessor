@@ -26,18 +26,18 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 @SuppressWarnings("WeakerAccess")
 public class DisruptorBatchProcessor<T> implements BatchProcessor<T> {
-    private static final Logger LOGGER = LoggerFactory.getLogger(DisruptorBatchProcessor.class);
-    private static final AtomicInteger ID = new AtomicInteger();
-    private final DisruptorBufferWriterProperties properties;
-    private final Disruptor<Event<T>> disruptor;
-    private final RingBuffer<Event<T>> ringBuffer;
-    private final AtomicInteger index = new AtomicInteger();
-    private final int workerCount;
-    private final Limiter limiter;
-    private final int maxBatchSize;
-    private final AsyncProcessor<T> reporter;
+    private static final Logger                   LOGGER = LoggerFactory.getLogger(DisruptorBatchProcessor.class);
+    private static final AtomicInteger            ID = new AtomicInteger();
+    private final        BatchProcessorProperties properties;
+    private final        Disruptor<Event<T>>      disruptor;
+    private final        RingBuffer<Event<T>>     ringBuffer;
+    private final        AtomicInteger            index = new AtomicInteger();
+    private final        int                      workerCount;
+    private final        Limiter                  limiter;
+    private final        int                      maxBatchSize;
+    private final        AsyncProcessor<T>        reporter;
 
-    public DisruptorBatchProcessor(DisruptorBufferWriterProperties properties, AsyncProcessor<T> reporter) {
+    public DisruptorBatchProcessor(BatchProcessorProperties properties, AsyncProcessor<T> reporter) {
         this.properties = Objects.requireNonNull(properties);
         this.reporter = Objects.requireNonNull(reporter);
         this.workerCount = properties.getWorkerCount();

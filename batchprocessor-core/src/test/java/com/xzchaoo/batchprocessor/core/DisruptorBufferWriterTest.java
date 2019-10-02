@@ -9,7 +9,7 @@ import org.junit.Test;
 public class DisruptorBufferWriterTest {
     @Test
     public void test() throws InterruptedException {
-        DisruptorBufferWriterProperties p = new DisruptorBufferWriterProperties();
+        BatchProcessorProperties p = new BatchProcessorProperties();
         // p.setQueueSize(4096);
         p.setBatchSize(1024);
         p.setConcurrency(8);
@@ -27,7 +27,7 @@ public class DisruptorBufferWriterTest {
 
     @Test
     public void test2() throws InterruptedException {
-        DisruptorBufferWriterProperties p = new DisruptorBufferWriterProperties();
+        BatchProcessorProperties p = new BatchProcessorProperties();
         p.setBatchSize(1024);
         p.setConcurrency(8);
         DisruptorBatchProcessor<Foo> w = new DisruptorBatchProcessor<>(p, new GrpcAsyncProcessor());

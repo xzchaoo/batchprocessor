@@ -5,7 +5,7 @@ import java.util.concurrent.ThreadFactory;
 /**
  * @author xzchaoo
  */
-public class DisruptorBufferWriterProperties {
+public class BatchProcessorProperties {
     /**
      * disruptor 队列大小, 必须是2^n
      */
@@ -138,7 +138,7 @@ public class DisruptorBufferWriterProperties {
 
     @Override
     public String toString() {
-        return "DisruptorBufferWriterProperties{" +
+        return "BatchProcessorProperties{" +
             "queueSize=" + queueSize +
             ", batchSize=" + batchSize +
             ", minBatchSize=" + minBatchSize +
