@@ -8,6 +8,8 @@ import java.util.Collection;
 public interface BatchProcessor<T> {
     void put(T t);
 
+    boolean tryPut(T t);
+
     void put(Collection<T> c);
 
     /**
