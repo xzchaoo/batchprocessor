@@ -4,7 +4,7 @@ import java.util.Objects;
 
 /**
  * @author xzchaoo
- * @date 2019/11/20
+ * @since 1.2.0
  */
 public class SingletonAsyncProcessorManager<T> implements AsyncProcessorManager<T> {
     private final AsyncProcessor<T> asyncProcessor;
