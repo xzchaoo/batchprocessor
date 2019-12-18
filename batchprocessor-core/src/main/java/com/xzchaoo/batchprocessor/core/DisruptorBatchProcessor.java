@@ -35,11 +35,18 @@ public class DisruptorBatchProcessor<T> implements BatchProcessor<T> {
     private final int workerCount;
     private final Limiter limiter;
     private final int maxBatchSize;
-    private final AsyncProcessor<T> reporter;
+    // private final AsyncProcessor<T> reporter;
+    private final AsyncProcessorManager<T> asyncProcessorManager;
+    private final List<AsyncProcessor<T>> asyncProcessors = new ArrayList<>();
 
     public DisruptorBatchProcessor(BatchProcessorProperties properties, AsyncProcessor<T> reporter) {
+        this(properties, new SingletonAsyncProcessorManager<>(reporter));
+    }
+
+    public DisruptorBatchProcessor(BatchProcessorProperties properties,
+                                   AsyncProcessorManager<T> asyncProcessorManager) {
         this.properties = Objects.requireNonNull(properties);
-        this.reporter = Objects.requireNonNull(reporter);
+        this.asyncProcessorManager = Objects.requireNonNull(asyncProcessorManager);
         this.workerCount = properties.getWorkerCount();
         if (workerCount <= 0) {
             throw new IllegalArgumentException("workerCount must greater than 0");
@@ -188,8 +195,11 @@ public class DisruptorBatchProcessor<T> implements BatchProcessor<T> {
         // 这里我们保留最后一个worker的barrier
         SequenceBarrier anyBarrier = null;
         for (int i = 0; i < workerCount; i++) {
+            // 记录并关闭
+            AsyncProcessor<T> asyncProcessor = asyncProcessorManager.create();
+            asyncProcessors.add(asyncProcessor);
             InnerEventHandler<T> handler = new InnerEventHandler<>(i, batchSize, minBatchSize, batchTime, limiter,
-                reporter);
+                asyncProcessor);
             anyBarrier = this.disruptor.handleEventsWith(handler).asSequenceBarrier();
         }
         // disruptor的start方法内部会去启动线程, 而启动线程理论上需要一定的时间
@@ -240,6 +250,9 @@ public class DisruptorBatchProcessor<T> implements BatchProcessor<T> {
                 throw new IllegalStateException("依旧有正在执行的请求");
             }
             limiter.releaseConcurrency(properties.getConcurrency());
+            for (AsyncProcessor<T> asyncProcessor : asyncProcessors) {
+                asyncProcessorManager.shutdown(asyncProcessor);
+            }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new IllegalStateException(e);

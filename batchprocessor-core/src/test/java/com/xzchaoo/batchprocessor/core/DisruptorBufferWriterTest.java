@@ -13,8 +13,19 @@ public class DisruptorBufferWriterTest {
         // p.setQueueSize(4096);
         p.setBatchSize(1024);
         p.setConcurrency(8);
+        p.setWorkerCount(2);
         // p.setIps(5000);
-        DisruptorBatchProcessor<Foo> processor = new DisruptorBatchProcessor<>(p, new GrpcAsyncProcessor());
+        DisruptorBatchProcessor<Foo> processor = new DisruptorBatchProcessor<>(p, new AsyncProcessorManager<Foo>() {
+            @Override
+            public AsyncProcessor<Foo> create() {
+                return new GrpcAsyncProcessor();
+            }
+
+            @Override
+            public void shutdown(AsyncProcessor<Foo> asyncProcessor) {
+                System.out.println("shutdown AsyncProcessor");
+            }
+        });
         processor.start();
         long b = System.currentTimeMillis();
         for (int i = 0; i < 65536; i++) {
