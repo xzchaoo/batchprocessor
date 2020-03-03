@@ -178,7 +178,7 @@ public class DisruptorBatchProcessor<T> implements BatchProcessor<T> {
             event.workerIndex = nextWorkerIndex();
             ++i;
         }
-        this.ringBuffer.publish(cursor, cursor + size - 1);
+        this.ringBuffer.publish(cursor, cursor + size);
     }
 
     private final AtomicInteger state = new AtomicInteger(0);
