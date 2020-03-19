@@ -1,5 +1,11 @@
 # release notes #
 
+## 1.2.3 ##
+- support try batch put
+
+## 1.2.2 ##
+- bugfix: batch put
+
 ## 1.1.0 ##
 - 将配置类更名为 BatchProcessorProperties
 

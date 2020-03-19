@@ -10,6 +10,8 @@ public interface BatchProcessor<T> {
 
     boolean tryPut(T t);
 
+    boolean tryPut(Collection<T> c);
+
     void put(Collection<T> c);
 
     /**

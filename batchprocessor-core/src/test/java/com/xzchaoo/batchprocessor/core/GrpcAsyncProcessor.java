@@ -16,7 +16,15 @@ import java.util.concurrent.atomic.AtomicInteger;
 public class GrpcAsyncProcessor implements AsyncProcessor<Foo> {
     private static final ScheduledExecutorService SCHEDULER = Executors.newSingleThreadScheduledExecutor();
 
-    private AtomicInteger finished = new AtomicInteger();
+    private AtomicInteger finished;
+
+    public GrpcAsyncProcessor() {
+        this(new AtomicInteger());
+    }
+
+    public GrpcAsyncProcessor(AtomicInteger finished) {
+        this.finished = finished;
+    }
 
     @Override
     public ListenableFuture<Object> asyncProcess(List<Foo> batch) {

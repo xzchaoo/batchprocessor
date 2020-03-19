@@ -27,17 +27,21 @@ import java.util.concurrent.atomic.AtomicInteger;
 @SuppressWarnings("WeakerAccess")
 public class DisruptorBatchProcessor<T> implements BatchProcessor<T> {
     private static final Logger LOGGER = LoggerFactory.getLogger(DisruptorBatchProcessor.class);
+    private static final int STATE_NOT_INIT = 0;
+    private static final int STATE_RUNNING = 1;
+    private static final int STATE_STOPPED = 2;
     private static final AtomicInteger ID = new AtomicInteger();
     private final BatchProcessorProperties properties;
     private final Disruptor<Event<T>> disruptor;
     private final RingBuffer<Event<T>> ringBuffer;
     private final AtomicInteger index = new AtomicInteger();
     private final int workerCount;
+    private final int workerMask;
     private final Limiter limiter;
     private final int maxBatchSize;
-    // private final AsyncProcessor<T> reporter;
     private final AsyncProcessorManager<T> asyncProcessorManager;
     private final List<AsyncProcessor<T>> asyncProcessors = new ArrayList<>();
+    private final AtomicInteger state = new AtomicInteger(0);
 
     public DisruptorBatchProcessor(BatchProcessorProperties properties, AsyncProcessor<T> reporter) {
         this(properties, new SingletonAsyncProcessorManager<>(reporter));
@@ -48,12 +52,18 @@ public class DisruptorBatchProcessor<T> implements BatchProcessor<T> {
         this.properties = Objects.requireNonNull(properties);
         this.asyncProcessorManager = Objects.requireNonNull(asyncProcessorManager);
         this.workerCount = properties.getWorkerCount();
+        // https://www.geeksforgeeks.org/program-to-find-whether-a-no-is-power-of-two/
+
         if (workerCount <= 0) {
             throw new IllegalArgumentException("workerCount must greater than 0");
         }
+        if (!isPowerOfTwo(workerCount)) {
+            throw new IllegalArgumentException("workerCount must be power of 2");
+        }
+        workerMask = workerCount - 1;
 
         int bufferSize = properties.getQueueSize();
-        this.maxBatchSize = Math.min(bufferSize, Math.max(bufferSize / 4, 512));
+        this.maxBatchSize = Math.min(bufferSize, Math.max(bufferSize / 8, 512));
         ThreadFactory threadFactory = properties.getThreadFactory() != null ? properties.getThreadFactory() :
             new ThreadFactoryBuilder()
                 .setNameFormat("DisruptorBatchProcessor-" + ID.getAndIncrement() + "-%d")
@@ -88,8 +98,19 @@ public class DisruptorBatchProcessor<T> implements BatchProcessor<T> {
         this.disruptor.setDefaultExceptionHandler(exceptionHandler);
     }
 
+    /**
+     * see <a href="https://www.geeksforgeeks.org/program-to-find-whether-a-no-is-power-of-two/">this doc</a>
+     *
+     * @param x
+     * @return
+     */
+    private static boolean isPowerOfTwo(int x) {
+        return x != 0 && ((x & (x - 1)) == 0);
+
+    }
+
     private int nextWorkerIndex() {
-        return workerCount == 1 ? 0 : ((index.getAndIncrement() & 0X7FFF_FFFF) % workerCount);
+        return workerCount == 1 ? 0 : (index.getAndIncrement() & workerMask);
     }
 
     @Override
@@ -136,6 +157,23 @@ public class DisruptorBatchProcessor<T> implements BatchProcessor<T> {
     }
 
     @Override
+    public boolean tryPut(Collection<T> c) {
+        ensureStarted();
+        if (c == null || c.isEmpty()) {
+            return true;
+        }
+        int size = c.size();
+        long hi;
+        try {
+            hi = this.ringBuffer.tryNext(size);
+        } catch (InsufficientCapacityException e) {
+            throw new IllegalStateException(e);
+        }
+        put0(c, hi - size + 1, hi);
+        return true;
+    }
+
+    @Override
     public void put(Collection<T> c) {
         ensureStarted();
         if (c == null || c.isEmpty()) {
@@ -144,6 +182,7 @@ public class DisruptorBatchProcessor<T> implements BatchProcessor<T> {
         int size = c.size();
 
         // 太大不可能一口气放进去 只能单个放 或 分小批
+        // TODO 这个有风险 可能部分已经放进去了
         if (size > maxBatchSize) {
             List<T> buffer = new ArrayList<>(maxBatchSize);
             for (T t : c) {
@@ -160,32 +199,35 @@ public class DisruptorBatchProcessor<T> implements BatchProcessor<T> {
             return;
         }
 
-        long cursor;
+        long hi;
         if (properties.isBlockOnInsufficientCapacity()) {
-            cursor = this.ringBuffer.next(size);
+            hi = this.ringBuffer.next(size);
         } else {
             try {
-                cursor = this.ringBuffer.tryNext(size);
+                hi = this.ringBuffer.tryNext(size);
             } catch (InsufficientCapacityException e) {
                 throw new IllegalStateException(e);
             }
         }
-        long i = cursor;
+        put0(c, hi - size + 1, hi);
+    }
+
+    private void put0(Collection<T> c, long lo, long hi) {
+        long i = lo;
+        int workerIndex = nextWorkerIndex();
         for (T t : c) {
             Event<T> event = this.ringBuffer.get(i);
             event.clear();
             event.t = t;
-            event.workerIndex = nextWorkerIndex();
+            event.workerIndex = (workerIndex++) & workerMask;
             ++i;
         }
-        this.ringBuffer.publish(cursor, cursor + size);
+        this.ringBuffer.publish(lo, hi);
     }
-
-    private final AtomicInteger state = new AtomicInteger(0);
 
     @Override
     public void start() {
-        if (!state.compareAndSet(0, 1)) {
+        if (!state.compareAndSet(STATE_NOT_INIT, STATE_RUNNING)) {
             throw new IllegalStateException("DisruptorBatchProcessor is already started");
         }
         long batchTime = properties.getBatchTime();
@@ -229,7 +271,7 @@ public class DisruptorBatchProcessor<T> implements BatchProcessor<T> {
     @Override
     public void stop() {
         // 先标记为stop, 此后进来的数据会被拒绝
-        int oldState = state.getAndSet(2);
+        int oldState = state.getAndSet(STATE_STOPPED);
         if (oldState != 1) {
             return;
         }
@@ -261,8 +303,8 @@ public class DisruptorBatchProcessor<T> implements BatchProcessor<T> {
 
     private void ensureStarted() {
         int state = this.state.get();
-        if (state != 1) {
-            if (state == 0) {
+        if (state != STATE_RUNNING) {
+            if (state == STATE_NOT_INIT) {
                 throw new IllegalStateException("DisruptorBatchProcessor is not yet started");
             } else {
                 throw new IllegalStateException("DisruptorBatchProcessor is already stopped");

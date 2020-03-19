@@ -46,7 +46,7 @@ public class BatchProcessorProperties {
     /**
      * 为true则当容量不足时阻塞, 否则异常
      */
-    private boolean blockOnInsufficientCapacity = true;
+    private boolean blockOnInsufficientCapacity = false;
 
     public int getQueueSize() {
         return queueSize;
