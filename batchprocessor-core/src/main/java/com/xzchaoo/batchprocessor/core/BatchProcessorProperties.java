@@ -48,6 +48,8 @@ public class BatchProcessorProperties {
      */
     private boolean blockOnInsufficientCapacity = false;
 
+    // private final
+
     public int getQueueSize() {
         return queueSize;
     }
