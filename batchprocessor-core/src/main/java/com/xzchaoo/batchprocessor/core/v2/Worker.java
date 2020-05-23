@@ -9,8 +9,12 @@ import com.lmax.disruptor.TimeoutException;
 import com.lmax.disruptor.dsl.Disruptor;
 import com.lmax.disruptor.dsl.ProducerType;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.ThreadFactory;
@@ -23,26 +27,41 @@ import java.util.concurrent.TimeUnit;
  */
 @SuppressWarnings("unchecked")
 class Worker<T> implements EventHandler<Event<T>> {
-    private static final Object FLUSH = new Object();
-    private static final Object ARG2_IS_LIST = new Object();
-    private static final Object ARG2_IS_LIST_STANDALONE = new Object();
+    private static final Logger LOGGER = LoggerFactory.getLogger(Worker.class);
+    private static final int FLUSH = 1;
+    private static final int ARG2_IS_LIST = 2;
+    private static final int ARG2_IS_LIST_STANDALONE = 3;
+    private static final int ARG2_IS_CONTEXT = 4;
     private final Disruptor<Event<T>> disruptor;
     private final RingBuffer<Event<T>> ringBuffer;
     private final boolean blockOnNext;
     private final int flushSize;
-    private final boolean copyFlushBuffer = false;
+    private final boolean copyWhenFlush;
     private final Flusher<T> flusher;
     private final Semaphore semaphore;
     private final SequenceBarrier barrier;
     private final List<T> buffer = new ArrayList<>();
+    private final BatchProcessorConfig config;
+    private final ScheduledExecutorService scheduler;
     private ScheduledFuture<?> flushTaskFuture;
 
-    Worker(int index, int flushSize, int bufferSize, ThreadFactory threadFactory, boolean blockOnNext,
-           Flusher<T> flusher, Semaphore semaphore) {
+    Worker(int index,
+           BatchProcessorConfig config,
+           int flushSize,
+           int bufferSize,
+           ThreadFactory threadFactory,
+           boolean blockOnNext,
+           boolean copyWhenFlush,
+           Flusher<T> flusher,
+           Semaphore semaphore,
+           ScheduledExecutorService scheduler) {
+        this.config = config;
         this.flushSize = flushSize;
         this.blockOnNext = blockOnNext;
         this.flusher = flusher;
         this.semaphore = semaphore;
+        this.copyWhenFlush = copyWhenFlush;
+        this.scheduler = scheduler;
         this.disruptor = new Disruptor<>(
             Event::new,
             bufferSize,
@@ -51,7 +70,6 @@ class Worker<T> implements EventHandler<Event<T>> {
             new LiteBlockingWaitStrategy());
         barrier = this.disruptor.handleEventsWith(this).asSequenceBarrier();
         this.ringBuffer = disruptor.getRingBuffer();
-        // TODO 怎么控制定期强制flush
     }
 
     void start(long forceFlushIntervalMills) {
@@ -63,7 +81,7 @@ class Worker<T> implements EventHandler<Event<T>> {
             throw new IllegalStateException("fail to init disruptor");
         }
         // TODO cancel when stop
-        flushTaskFuture = DisruptorBatchProcessor.SCHEDULER.scheduleWithFixedDelay(this::flush,
+        flushTaskFuture = scheduler.scheduleWithFixedDelay(this::flush,
             forceFlushIntervalMills,
             forceFlushIntervalMills,
             TimeUnit.MILLISECONDS);
@@ -74,11 +92,12 @@ class Worker<T> implements EventHandler<Event<T>> {
         try {
             cursor = ringBuffer.tryNext();
         } catch (InsufficientCapacityException e) {
+            LOGGER.warn("fail to get next cursor for flush");
             return;
         }
         Event<T> event = ringBuffer.get(cursor);
         event.clear();
-        event.arg1 = FLUSH;
+        event.arg_int = FLUSH;
         ringBuffer.publish(cursor);
     }
 
@@ -116,7 +135,7 @@ class Worker<T> implements EventHandler<Event<T>> {
         long cursor = this.ringBuffer.next();
         Event<T> event = this.ringBuffer.get(cursor);
         event.clear();
-        event.arg1 = ARG2_IS_LIST;
+        event.arg_int = ARG2_IS_LIST;
         event.arg2 = list;
         this.ringBuffer.publish(cursor);
     }
@@ -124,7 +143,10 @@ class Worker<T> implements EventHandler<Event<T>> {
     void put(T t) {
         if (blockOnNext) {
             long cursor = this.ringBuffer.next();
-            publish(t, cursor);
+            Event<T> event = this.ringBuffer.get(cursor);
+            event.clear();
+            event.payload = t;
+            this.ringBuffer.publish(cursor);
         } else {
             if (!tryPut(t)) {
                 throw new IllegalStateException("buffer is full");
@@ -132,18 +154,11 @@ class Worker<T> implements EventHandler<Event<T>> {
         }
     }
 
-    private void publish(T t, long cursor) {
-        Event<T> event = this.ringBuffer.get(cursor);
-        event.clear();
-        event.payload = t;
-        this.ringBuffer.publish(cursor);
-    }
-
     void putAsWhole(List<T> coll, boolean needCopy) {
         long cursor = this.ringBuffer.next();
         Event<T> event = this.ringBuffer.get(cursor);
         event.clear();
-        event.arg1 = ARG2_IS_LIST_STANDALONE;
+        event.arg_int = ARG2_IS_LIST_STANDALONE;
         event.arg2 = needCopy ? new ArrayList<>(coll) : coll;
         this.ringBuffer.publish(cursor);
     }
@@ -170,27 +185,38 @@ class Worker<T> implements EventHandler<Event<T>> {
 
     @Override
     public void onEvent(Event<T> event, long sequence, boolean endOfBatch) throws Exception {
-        Object arg1 = event.arg1;
-        if (arg1 == null) {
-            // normal case
-            buffer.add(event.payload);
-            if (buffer.size() >= this.flushSize) {
+        switch (event.arg_int) {
+            case 0:
+                // normal case
+                buffer.add(event.payload);
+                if (buffer.size() >= this.flushSize) {
+                    flush0(buffer, true);
+                }
+                break;
+            case FLUSH:
                 flush0(buffer, true);
+                break;
+            case ARG2_IS_LIST: {
+                List<T> batch = (List<T>) event.arg2;
+                if (buffer.size() + batch.size() >= this.flushSize) {
+                    flush0(buffer, true);
+                    flush0(batch, false);
+                } else {
+                    this.buffer.addAll(batch);
+                }
             }
-        } else if (arg1 == FLUSH) {
-            flush0(buffer, true);
-        } else if (arg1 == ARG2_IS_LIST) {
-            List<T> batch = (List<T>) event.arg2;
-            if (buffer.size() + batch.size() >= this.flushSize) {
+            break;
+            case ARG2_IS_LIST_STANDALONE: {
                 flush0(buffer, true);
+                List<T> batch = (List<T>) event.arg2;
                 flush0(batch, false);
-            } else {
-                this.buffer.addAll(batch);
             }
-        } else if (arg1 == ARG2_IS_LIST_STANDALONE) {
-            flush0(buffer, true);
-            List<T> batch = (List<T>) event.arg2;
-            flush0(batch, false);
+            break;
+            case ARG2_IS_CONTEXT:
+                flush0((Context) event.arg2);
+                break;
+            default:
+                break;
         }
     }
 
@@ -198,7 +224,7 @@ class Worker<T> implements EventHandler<Event<T>> {
         if (batch0.isEmpty()) {
             return;
         }
-        List<T> batch = copyFlushBuffer ? new ArrayList<>(batch0) : batch0;
+        List<T> batch = copyWhenFlush ? new ArrayList<>(batch0) : batch0;
         try {
             semaphore.acquire();
         } catch (InterruptedException e) {
@@ -213,9 +239,38 @@ class Worker<T> implements EventHandler<Event<T>> {
         }
     }
 
+    private void flush0(Context context) {
+        try {
+            semaphore.acquire();
+        } catch (InterruptedException e) {
+            throw new IllegalStateException("fail to acquire semaphore", e);
+        }
+        flusher.flush(context.batch, context);
+    }
+
+    public Stat.WorkerStat stat() {
+        Stat.WorkerStat stat = new Stat.WorkerStat();
+        stat.usedBufferSize = (int) (ringBuffer.getBufferSize() - this.ringBuffer.remainingCapacity());
+        stat.totalBufferSize = ringBuffer.getBufferSize();
+        return stat;
+    }
+
     private class Context implements Flusher.Context<T> {
+        private int retryCount;
+        private List<T> batch;
+
         Context() {
 
+        }
+
+        @Override
+        public int retryCount() {
+            return retryCount;
+        }
+
+        @Override
+        public int maxRetryCount() {
+            return config.getMaxRetryCount();
         }
 
         @Override
@@ -232,8 +287,26 @@ class Worker<T> implements EventHandler<Event<T>> {
         @Override
         public void retry(long delayMills, List<T> batch) {
             semaphore.release();
-            DisruptorBatchProcessor.SCHEDULER.schedule(() -> putAsWhole(batch, false), delayMills,
-                TimeUnit.MILLISECONDS);
+            if (++retryCount > maxRetryCount()) {
+                LOGGER.warn("discard retry {}", batch);
+            } else {
+                this.batch = batch;
+                // TODO cancel this future when stop
+                // try catch exception when shutdown
+                scheduler.schedule(() -> {
+                    putRetry(this);
+                }, delayMills, TimeUnit.MILLISECONDS);
+            }
         }
+
+    }
+
+    private void putRetry(Context context) {
+        long cursor = this.ringBuffer.next();
+        Event<T> event = this.ringBuffer.get(cursor);
+        event.clear();
+        event.arg_int = ARG2_IS_CONTEXT;
+        event.arg2 = context;
+        this.ringBuffer.publish(cursor);
     }
 }

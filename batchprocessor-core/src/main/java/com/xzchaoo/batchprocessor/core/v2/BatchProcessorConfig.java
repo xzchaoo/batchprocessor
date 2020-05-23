@@ -8,16 +8,55 @@ import java.util.concurrent.ThreadFactory;
  * @author xzchaoo
  */
 public class BatchProcessorConfig {
-    private String name;
-    private int workerCount = 1;
-    private int concurrency = 16;
-    private int flushSize = 1024;
-    private int bufferSize = 65536;
-    private ThreadFactory threadFactory;
-    private boolean blockingOnInsufficientCapacity = false;
+    /**
+     * [required] name of instance
+     */
+    private String name = "default";
+    /**
+     * [required] flusher factory
+     */
     private Flusher.Factory<?> flusherFactory;
+    /**
+     * backend worker thread count, often 1 worker is enough, otherwise
+     */
+    private int workerCount = 1;
+    /**
+     * max concurrency in-flights requests, shared by all workers
+     */
+    private int concurrency = 16;
+    /**
+     * how many items should bu flush in a batch
+     */
+    private int flushSize = 1024;
+    /**
+     * buffer size every work has
+     */
+    private int bufferSize = 65536;
+    /**
+     * thread factory for workers, defaults to "${name}-%d"
+     */
+    private ThreadFactory threadFactory;
+    /**
+     * blocks on insufficient capacity or else throws an exception
+     */
+    private boolean blockingOnInsufficientCapacity = false;
+    /**
+     * interval for a force flush
+     */
     private long forceFlushIntervalMills = 1000;
+    /**
+     * stop(shutdown) wait timeout
+     */
     private long stopTimeoutMills = 5000;
+    /**
+     * Copy buffer when flush. When false, same internal buffer will be fed to flusher, this buffer will be clear after
+     * flush method call.  Flusher should not hold reference to buffer instance after flush method call.
+     */
+    private boolean copyWhenFlush = true;
+    /**
+     * Max retry count, any retry whose count exceed this value will be discard and log a warn.
+     */
+    private int maxRetryCount = 1;
 
     public String getName() {
         return name;
@@ -97,5 +136,21 @@ public class BatchProcessorConfig {
 
     public void setStopTimeoutMills(long stopTimeoutMills) {
         this.stopTimeoutMills = stopTimeoutMills;
+    }
+
+    public boolean isCopyWhenFlush() {
+        return copyWhenFlush;
+    }
+
+    public void setCopyWhenFlush(boolean copyWhenFlush) {
+        this.copyWhenFlush = copyWhenFlush;
+    }
+
+    public int getMaxRetryCount() {
+        return maxRetryCount;
+    }
+
+    public void setMaxRetryCount(int maxRetryCount) {
+        this.maxRetryCount = maxRetryCount;
     }
 }

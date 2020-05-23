@@ -38,6 +38,9 @@ public interface BatchProcessor<T> {
      */
     void put(List<T> coll);
 
+    /**
+     * async flush
+     */
     void flush();
 
     /**
@@ -49,4 +52,6 @@ public interface BatchProcessor<T> {
      * stop
      */
     void stop();
+
+    Stat stat();
 }

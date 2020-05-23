@@ -11,7 +11,6 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 
 /**
@@ -26,56 +25,66 @@ public class DisruptorBatchProcessor<T> implements BatchProcessor<T> {
     private static final int STATE_NEW = 0;
     private static final int STATE_STARTED = 1;
     private static final int STATE_STOPPED = 2;
-    private static final AtomicIntegerFieldUpdater UPDATER =
+    private static final AtomicIntegerFieldUpdater STATE_UPDATER =
         AtomicIntegerFieldUpdater.newUpdater(DisruptorBatchProcessor.class, "state");
-    static final ScheduledExecutorService SCHEDULER = Executors.newSingleThreadScheduledExecutor();
+    private static final AtomicIntegerFieldUpdater WORKER_UPDATER =
+        AtomicIntegerFieldUpdater.newUpdater(DisruptorBatchProcessor.class, "workerIndex");
+
     private final BatchProcessorConfig config;
     private final Worker<T>[] workers;
-    private final int workerCount;
+    private final Worker<T> worker0;
+    private final int workerCountMinus1;
     private volatile int state = STATE_NEW;
     private final Semaphore semaphore;
+    private volatile int workerIndex;
+    private final ScheduledExecutorService scheduler;
 
     public DisruptorBatchProcessor(BatchProcessorConfig config) {
         this.config = Objects.requireNonNull(config);
+        Objects.requireNonNull(config.getName());
+        Objects.requireNonNull(config.getFlusherFactory());
         int workerCount = config.getWorkerCount();
         if (workerCount < 0) {
             throw new IllegalArgumentException();
         }
-        this.workerCount = workerCount;
-        workers = new Worker[workerCount];
-        semaphore = new Semaphore(config.getConcurrency());
+        this.workerCountMinus1 = workerCount - 1;
+        this.workers = new Worker[workerCount];
+        this.semaphore = new Semaphore(config.getConcurrency());
         ThreadFactory threadFactory = config.getThreadFactory();
         if (threadFactory == null) {
             threadFactory = new SimpleThreadFactory(config.getName());
             // config
         }
+        this.scheduler = Executors.newSingleThreadScheduledExecutor(new SimpleThreadFactory(
+            config.getName() + "-scheduler"));
         for (int i = 0; i < workerCount; i++) {
             // waitStrategy 不能共享
-            workers[i] = new Worker<>(i,
+            this.workers[i] = new Worker<>(i,
+                config,
                 config.getFlushSize(),
                 config.getBufferSize(),
                 threadFactory,
                 config.isBlockingOnInsufficientCapacity(),
+                config.isCopyWhenFlush(),
                 (Flusher<T>) config.getFlusherFactory().create(i),
-                semaphore);
+                this.semaphore,
+                this.scheduler);
         }
+        worker0 = workerCount == 1 ? workers[0] : null;
     }
 
-    private final AtomicInteger workerIndex = new AtomicInteger();
-
     private Worker<T> nextWorker() {
-        if (workerCount == 1) {
-            return workers[0];
+        if (worker0 != null) {
+            return worker0;
         }
         int i;
         while (true) {
-            i = workerIndex.get();
-            int n = (i + 1 == workerCount) ? 0 : (i + 1);
-            if (workerIndex.compareAndSet(i, n)) {
-                break;
+            i = workerIndex;
+            int n = (i == workerCountMinus1) ? 0 : (i + 1);
+            if (WORKER_UPDATER.compareAndSet(this, i, n)) {
+                return workers[i];
             }
         }
-        return workers[i];
     }
 
     @Override
@@ -99,24 +108,28 @@ public class DisruptorBatchProcessor<T> implements BatchProcessor<T> {
 
     @Override
     public void put(List<T> list) {
-        // 批量put方法导致数量统计错误
+        if (list.isEmpty()) {
+            return;
+        }
+        // 批量put方法导致数量统计错误 bufferSize 参数会失去意义
+        // 有一种办法是用一些NULL的event占据位置
 
         // 可以分割到多个worker里去
-        int bufferSize = this.config.getBufferSize();
-        if (list.size() <= bufferSize) {
+        int flushSize = this.config.getFlushSize();
+        if (list.size() <= flushSize) {
             nextWorker().put(new ArrayList<>(list));
             return;
         }
-        List<T> buffer = new ArrayList<>(bufferSize);
+        List<T> batch = new ArrayList<>(flushSize);
         for (T t : list) {
-            buffer.add(t);
-            if (buffer.size() == bufferSize) {
-                nextWorker().putAsWhole(buffer, true);
-                buffer.clear();
+            batch.add(t);
+            if (batch.size() == flushSize) {
+                nextWorker().putAsWhole(batch, true);
+                batch.clear();
             }
         }
-        if (buffer.size() > 0) {
-            nextWorker().putAsWhole(buffer, false);
+        if (batch.size() > 0) {
+            nextWorker().putAsWhole(batch, false);
         }
     }
 
@@ -129,7 +142,7 @@ public class DisruptorBatchProcessor<T> implements BatchProcessor<T> {
 
     @Override
     public void start() {
-        if (UPDATER.compareAndSet(this, STATE_NEW, STATE_STARTED)) {
+        if (STATE_UPDATER.compareAndSet(this, STATE_NEW, STATE_STARTED)) {
             long forceFlushIntervalMills = config.getForceFlushIntervalMills();
             for (Worker<T> worker : workers) {
                 worker.start(forceFlushIntervalMills);
@@ -146,7 +159,7 @@ public class DisruptorBatchProcessor<T> implements BatchProcessor<T> {
 
     @Override
     public void stop() {
-        if (UPDATER.compareAndSet(this, STATE_STARTED, STATE_STOPPED)) {
+        if (STATE_UPDATER.compareAndSet(this, STATE_STARTED, STATE_STOPPED)) {
             for (Worker<T> worker : workers) {
                 worker.stop(config.getStopTimeoutMills());
             }
@@ -157,6 +170,7 @@ public class DisruptorBatchProcessor<T> implements BatchProcessor<T> {
             } catch (InterruptedException e) {
                 throw new IllegalStateException("fail to wait", e);
             }
+            scheduler.shutdownNow();
         } else {
             int state = this.state;
             if (state == STATE_NEW) {
@@ -165,5 +179,34 @@ public class DisruptorBatchProcessor<T> implements BatchProcessor<T> {
                 LOGGER.info("This BatchProcessor has been stopped");
             }
         }
+    }
+
+    @Override
+    public Stat stat() {
+        Stat stat = new Stat();
+        switch (this.state) {
+            case STATE_NEW:
+                stat.state = "new";
+                break;
+            case STATE_STARTED:
+                stat.state = "started";
+                break;
+            case STATE_STOPPED:
+                stat.state = "stopped";
+                break;
+            default:
+                break;
+        }
+
+        for (Worker<T> worker : workers) {
+            Stat.WorkerStat workerStat = worker.stat();
+            stat.usedBufferSize += workerStat.usedBufferSize;
+            stat.totalBufferSize += workerStat.totalBufferSize;
+            stat.getWorkers().add(workerStat);
+        }
+        stat.semaphoreStat.availablePermits = this.semaphore.availablePermits();
+        stat.semaphoreStat.maxPermits = this.config.getConcurrency();
+        stat.semaphoreStat.queuedSize = this.semaphore.getQueueLength();
+        return stat;
     }
 }
