@@ -22,7 +22,7 @@ public class InnerContext<T> implements Flusher.Context {
     }
 
     @Override
-    public boolean retry() {
+    public boolean retry(long delayMills) {
         return false;
     }
 }

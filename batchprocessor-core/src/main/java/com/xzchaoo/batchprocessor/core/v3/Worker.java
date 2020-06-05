@@ -80,7 +80,8 @@ class Worker<T> implements EventHandler<Event<T>> {
         }
 
         try {
-            flusher.flush(batch, new Context());
+            List<T> copy = new ArrayList<>(batch);
+            flusher.flush(copy, new Context());
         } finally {
             if (clear) {
                 batch.clear();
