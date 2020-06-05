@@ -9,6 +9,10 @@ import java.util.List;
 public interface Flusher<T> {
     void flush(List<T> batch, Context context);
 
+    interface Factory<T> {
+        Flusher<T> create(int index);
+    }
+
     interface Context {
         /**
          * complete
@@ -19,6 +23,6 @@ public interface Flusher<T> {
 
         int maxRetryCount();
 
-        boolean retry();
+        boolean retry(long delayMills);
     }
 }

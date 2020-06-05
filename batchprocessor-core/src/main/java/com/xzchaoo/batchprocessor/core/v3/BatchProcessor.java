@@ -5,6 +5,8 @@ package com.xzchaoo.batchprocessor.core.v3;
  * @date 2020-06-04
  */
 public interface BatchProcessor<T> {
+    int workerCount();
+
     void start();
 
     void stop();
