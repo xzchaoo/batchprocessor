@@ -1,17 +1,17 @@
 package com.xzchaoo.batchprocessor.core.v3;
 
+import java.time.Duration;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
+
 import com.lmax.disruptor.InsufficientCapacityException;
 import com.lmax.disruptor.LiteBlockingWaitStrategy;
 import com.lmax.disruptor.RingBuffer;
 import com.lmax.disruptor.dsl.Disruptor;
 import com.lmax.disruptor.dsl.ProducerType;
+import com.xzchaoo.batchprocessor.core.v2.OneThreadFactory;
 import com.xzchaoo.batchprocessor.core.v2.SimpleThreadFactory;
-
-import java.util.ArrayDeque;
-import java.util.List;
-import java.util.concurrent.ScheduledThreadPoolExecutor;
-import java.util.concurrent.Semaphore;
-import java.util.concurrent.TimeUnit;
 
 /**
  * @author xiangfeng.xzc
@@ -19,78 +19,120 @@ import java.util.concurrent.TimeUnit;
  */
 public class DisruptorBatchProcessor<T> implements BatchProcessor<T> {
 
-    private final Disruptor<Event<T>> disruptor;
-    private final RingBuffer<Event<T>> ringBuffer;
-    private final int workerCount;
-    private final int maxBatchSize;
-    private final int maxConcurrency;
-    private int wip;
-    private ArrayDeque<List<T>> delayed = new ArrayDeque<>(65536);
-    private boolean flushOnEndOfBeach = false;
-    private final ScheduledThreadPoolExecutor scheduler;
+    // shared begin
+    private Disruptor<Event<T>> disruptor;
+    // shared end
 
-    public DisruptorBatchProcessor(int workerCount, int maxBatchSize, int maxConcurrency, Flusher.Factory<T> factory) {
-        this.workerCount = workerCount;
-        this.maxBatchSize = maxBatchSize;
-        this.maxConcurrency = maxConcurrency;
-        disruptor = new Disruptor<>(
-            Event::new,
-            65536,
-            new SimpleThreadFactory("test"),
-            ProducerType.MULTI,
-            new LiteBlockingWaitStrategy());
-        Semaphore semaphore = new Semaphore(maxConcurrency);
-        for (int i = 0; i < workerCount; i++) {
-            Worker<T> worker = new Worker<>(i, maxBatchSize, factory.create(i), semaphore, true);
-            disruptor.handleEventsWith(worker);
-        }
-        scheduler = new ScheduledThreadPoolExecutor(1,
-            new SimpleThreadFactory("Foo-Scheduler"));
-        ringBuffer = disruptor.getRingBuffer();
+    private final BatchProcessorConfig config;
+    private final int                  workerCount;
+
+    private       ScheduledThreadPoolExecutor scheduler;
+    private final Semaphore                   semaphore;
+    private final Flusher.Factory<T>          factory;
+
+    @SuppressWarnings("unchecked")
+    private Worker<T>[] workers;
+    private Worker      worker;
+
+    public DisruptorBatchProcessor(BatchProcessorConfig config, Flusher.Factory<T> factory) {
+        this.workerCount = config.getWorkerCount();
+        this.config = config;
+        this.semaphore = new Semaphore(config.getMaxConcurrency());
+        this.factory = factory;
     }
 
     @Override
     public int workerCount() {
-        return workerCount;
+        return config.getWorkerCount();
     }
 
     @Override
     public void start() {
-        disruptor.start();
-        scheduler.scheduleWithFixedDelay(this::flush, 1, 1, TimeUnit.SECONDS);
-    }
-
-    private void flush() {
-        long cursor;
-        try {
-            cursor = ringBuffer.tryNext();
-        } catch (InsufficientCapacityException e) {
-            return;
+        this.scheduler = new ScheduledThreadPoolExecutor(1, new OneThreadFactory(config.getName() + "-Scheduler"));
+        Duration interval = config.getFlushInterval();
+        workers = new Worker[config.getWorkerCount()];
+        if (config.isShared()) {
+            this.disruptor = new Disruptor<>(
+                    Event::new,
+                    config.getRingBufferSize(),
+                    new SimpleThreadFactory(config.getName()),
+                    ProducerType.MULTI,
+                    new LiteBlockingWaitStrategy());
+            RingBuffer<Event<T>> ringBuffer = disruptor.getRingBuffer();
+            for (int i = 0; i < config.getWorkerCount(); i++) {
+                SharedWorker<T> worker = new SharedWorker<>(i,
+                        config,
+                        factory.create(i),
+                        scheduler,
+                        semaphore,
+                        ringBuffer);
+                workers[i] = worker;
+                if (i == 0) {
+                    this.worker = worker;
+                }
+                this.disruptor.handleEventsWith(worker);
+            }
+            disruptor.start();
+            scheduler.scheduleWithFixedDelay(() -> {
+                long cursor;
+                try {
+                    cursor = ringBuffer.tryNext();
+                } catch (InsufficientCapacityException e) {
+                    return;
+                }
+                Event<T> event = ringBuffer.get(cursor);
+                event.action = Worker.ACTION_FLUSH;
+            }, interval.toMillis(), interval.toMillis(), TimeUnit.MILLISECONDS);
+        } else {
+            for (int i = 0; i < config.getWorkerCount(); i++) {
+                StandaloneWorker<T> worker = new StandaloneWorker<>(i, config, scheduler, semaphore, factory.create(i));
+                workers[i] = worker;
+                worker.start();
+                if (i == 0) {
+                    this.worker = worker;
+                }
+            }
+            scheduler.scheduleWithFixedDelay(() -> {
+                for (Worker<T> worker : workers) {
+                    worker.flush();
+                }
+            }, interval.toMillis(), interval.toMillis(), TimeUnit.MILLISECONDS);
         }
-        Event<T> event = ringBuffer.get(cursor);
-        event.action = Worker.ACTION_FLUSH_ALL;
     }
 
     @Override
-    public void stop() {
-        disruptor.shutdown();
+    public void stop(boolean waitForAllToComplete) {
+        ScheduledThreadPoolExecutor scheduler = this.scheduler;
+        this.scheduler = null;
+        if (scheduler != null) {
+            scheduler.shutdownNow();
+        }
+        if (config.isShared()) {
+            disruptor.shutdown();
+        } else {
+            for (Worker<T> worker : workers) {
+                worker.stop(waitForAllToComplete);
+            }
+        }
     }
 
     @Override
     public boolean tryPut(T t) {
-        return false;
+        return nextWorker().tryPut(t);
     }
 
     @Override
     public void put(T t) {
-        if (t == null) {
-            throw new NullPointerException();
+        nextWorker().put(t);
+    }
+
+    private int workerIndex;
+
+    private Worker<T> nextWorker() {
+        if (workerCount == 1) {
+            return worker;
         }
-        long cursor = ringBuffer.next();
-        Event<T> event = ringBuffer.get(cursor);
-        event.index = 0;
-        event.action = Worker.ACTION_ADD;
-        event.payload = t;
-        ringBuffer.publish(cursor);
+        int index = (this.workerIndex++ & 0X7FFF_FFFF) % (workerCount);
+        return workers[index];
     }
 }

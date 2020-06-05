@@ -9,7 +9,7 @@ public interface BatchProcessor<T> {
 
     void start();
 
-    void stop();
+    void stop(boolean waitForAllToComplete);
 
     boolean tryPut(T t);
 
