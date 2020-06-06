@@ -19,6 +19,7 @@ public class DisruptorBatchProcessorTest {
         config.setWorkerCount(2);
         config.setMaxBatchSize(4);
         config.setMaxConcurrency(2);
+        config.setShared(true);
         BatchProcessor<String> p = new DisruptorBatchProcessor<>(config, new Flusher.Factory<String>() {
             @Override
             public Flusher<String> create(int index) {

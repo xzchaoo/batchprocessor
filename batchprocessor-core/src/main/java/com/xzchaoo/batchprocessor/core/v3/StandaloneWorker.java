@@ -2,9 +2,11 @@ package com.xzchaoo.batchprocessor.core.v3;
 
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
 
 import com.lmax.disruptor.EventHandler;
 import com.lmax.disruptor.LiteBlockingWaitStrategy;
+import com.lmax.disruptor.TimeoutException;
 import com.lmax.disruptor.dsl.Disruptor;
 import com.lmax.disruptor.dsl.ProducerType;
 import com.xzchaoo.batchprocessor.core.v2.OneThreadFactory;
@@ -39,6 +41,10 @@ class StandaloneWorker<T> extends Worker<T> implements EventHandler<Event<T>> {
     @Override
     void stop(boolean waitForAllToComplete) {
         super.stop(waitForAllToComplete);
-        disruptor.shutdown();
+        try {
+            disruptor.shutdown(config.getCloseWaitTimeoutMills(), TimeUnit.MILLISECONDS);
+        } catch (TimeoutException e) {
+            throw new IllegalStateException("close timeout", e);
+        }
     }
 }

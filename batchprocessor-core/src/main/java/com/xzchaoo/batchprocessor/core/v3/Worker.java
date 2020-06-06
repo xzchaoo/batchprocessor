@@ -2,6 +2,7 @@ package com.xzchaoo.batchprocessor.core.v3;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
@@ -80,7 +81,6 @@ abstract class Worker<T> {
         ringBuffer.publish(cursor);
     }
 
-    @Deprecated
     void flush() {
         long cursor;
         try {
@@ -95,35 +95,28 @@ abstract class Worker<T> {
     }
 
     public void onEvent(Event<T> event, long sequence, boolean endOfBatch) throws Exception {
+        if (event.action == ACTION_FLUSH) {
+            flush(buffer, true);
+            return;
+        }
+        if (event.index != index) {
+            return;
+        }
         switch (event.action) {
             case ACTION_ADD:
-                if (event.index != index) {
-                    return;
-                }
                 buffer.add(event.payload);
                 if (buffer.size() == maxBatchSize) {
                     flush(buffer, true);
                 }
                 event.clear();
                 break;
-            case ACTION_FLUSH:
-                if (event.index != index) {
-                    return;
-                }
-                flush(buffer, true);
-                // 此处不能清理
-                break;
             case ACTION_RETRY:
-                if (event.index != index) {
-                    return;
-                }
                 flush((SharedWorker.Context) event.arg1);
                 event.clear();
                 break;
             default:
                 break;
         }
-
         if (flushOnEndOfBatch && endOfBatch) {
             flush(buffer, true);
         }
@@ -191,20 +184,26 @@ abstract class Worker<T> {
             if (retryCount < maxRetryCount) {
                 // schedule
                 ++retryCount;
-                scheduler.schedule(() -> {
-                    long cursor;
-                    try {
-                        cursor = ringBuffer.tryNext();
-                    } catch (InsufficientCapacityException e) {
-                        LOGGER.error("ringBuffer is full when retry", e);
-                        return;
-                    }
-                    Event<T> event = ringBuffer.get(cursor);
-                    event.index = index;
-                    event.action = ACTION_RETRY;
-                    event.arg1 = this;
-                    ringBuffer.publish(cursor);
-                }, delayMills, TimeUnit.MILLISECONDS);
+                try {
+                    scheduler.schedule(() -> {
+                        long cursor;
+                        try {
+                            cursor = ringBuffer.tryNext();
+                        } catch (InsufficientCapacityException e) {
+                            LOGGER.error("ringBuffer is full when retry", e);
+                            return;
+                        }
+                        Event<T> event = ringBuffer.get(cursor);
+                        // republish on same worker
+                        event.index = index;
+                        event.action = ACTION_RETRY;
+                        event.arg1 = this;
+                        ringBuffer.publish(cursor);
+                    }, delayMills, TimeUnit.MILLISECONDS);
+                } catch (RejectedExecutionException e) {
+                    LOGGER.error("retry rejected", e);
+                    return false;
+                }
                 return true;
             }
             return false;
